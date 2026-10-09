@@ -108,6 +108,98 @@ Then change `handleVoteRequest` and `sendRequestToPeers` to use `lastIndex()` an
 
 ---
 
+## 4b. Exact shapes (signatures only, no bodies)
+
+These match your phase 1 style (`uint64` ids and terms, methods on `*Node`). The bodies are yours.
+
+### `message.go`
+```go
+type Entry struct {
+	Term  uint64
+	Index uint64
+	Data  []byte
+}
+
+type Message struct {
+	Type         MsgType
+	From         uint64
+	To           uint64
+	Term         uint64
+	LastLogIndex uint64 // VoteRequest
+	LastLogTerm  uint64 // VoteRequest
+	Reject       bool   // VoteResponse, HeartbeatResponse
+	PrevLogIndex uint64 // Heartbeat (AppendEntries)
+	PrevLogTerm  uint64 // Heartbeat (AppendEntries)
+	Entries      []Entry // Heartbeat (AppendEntries), empty = pure heartbeat
+	LeaderCommit uint64 // Heartbeat (AppendEntries)
+	Index        uint64 // HeartbeatResponse: "I match you up to here"
+}
+```
+Adding fields breaks your positional `Message{...}` literals. That's a good moment to switch to named fields.
+
+### `Node`: fields to remove and add
+```go
+// remove:
+//   lastLogIndex uint64
+//   lastLogTerm  uint64
+
+// add:
+log         []Entry           // log[0] is a dummy {Term: 0, Index: 0}
+commitIndex uint64
+lastApplied uint64
+committed   []Entry           // drained by CommittedEntries()
+nextIndex   map[uint64]uint64 // leader only
+matchIndex  map[uint64]uint64 // leader only
+```
+In `NewNode`: `log` starts as a one-element slice holding the dummy, and both maps are made with `make`.
+
+### Public methods
+```go
+func (n *Node) Propose(data []byte) bool  // false if not leader
+func (n *Node) CommittedEntries() []Entry // drain, like ReadMessages
+// Tick, Step, ReadMessages: same signatures as phase 1
+```
+
+### Log helpers (`log.go` if you want a separate file)
+```go
+func (n *Node) lastIndex() uint64
+func (n *Node) lastTerm() uint64
+func (n *Node) termAt(i uint64) (uint64, bool) // false if i is past the end
+```
+
+### Leader side
+```go
+func (n *Node) sendAppend(peer uint64)               // one AppendEntries to one peer
+func (n *Node) sendHeartbeats()                      // now: sendAppend to every peer
+func (n *Node) becomeLeader()                        // + reset nextIndex/matchIndex, append no-op
+func (n *Node) handleHeartbeatResponse(m Message)    // success → match/next, maybeCommit; reject → back up, resend
+func (n *Node) maybeCommit()                         // highest N with majority match AND termAt(N) == currentTerm
+```
+
+### Follower side
+```go
+func (n *Node) handleHeartbeat(m Message)            // consistency check, merge entries, learn commit, reply
+```
+
+### Everyone
+```go
+func (n *Node) applyCommitted()                      // move log[lastApplied+1 .. commitIndex] into committed
+```
+
+### `Step` switch, final shape
+`VoteRequest` → `handleVoteRequest`, `VoteResponse` → `handleVoteResponse`, `Heartbeat` → `handleHeartbeat`, `HeartbeatResponse` → `handleHeartbeatResponse` (new).
+
+### Simulator additions (`network_test.go`)
+```go
+func (nw *network) leader() uint64               // the single current leader, 0 if none
+func (nw *network) propose(data string) bool     // Propose on the current leader
+func (nw *network) applied(id uint64) []Entry    // everything node id has applied so far
+func (nw *network) checkStateMachineSafety()     // run after every tick: no two nodes applied different Data at the same Index
+```
+`tick` should call `CommittedEntries()` on every node after delivery and store the results, so `applied` and the safety check have something to read.
+
+---
+
 ## 5. A full round trip (3 nodes, leader = 1)
 
 1. A test calls `node1.Propose("x")`. Node 1 appends entry `{Term 1, Index 2, "x"}` (index 1 is the no-op) and puts AppendEntries for nodes 2 and 3 in its outbox: `Prev = (1, term 1)`, `Entries = [x]`, `LeaderCommit = 1`.
