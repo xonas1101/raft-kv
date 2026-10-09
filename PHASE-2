@@ -1,0 +1,193 @@
+# Phase 2: Log Replication, in plain terms
+
+Phase 1 gave the cluster a boss. Phase 2 gives the boss a job: **keep everyone's notebook identical.**
+
+Each node keeps a **log**, a numbered list of commands like `set x=5`, `set y=2`. The leader accepts new commands, copies them to every follower in the same order, and once a **majority** has a command written down, it's **committed**. Committed means it can never be lost or changed, so every node can safely **apply** it (in phase 5, "apply" means actually updating the key-value map).
+
+You're still writing **one node's code**. Nobody sees all the logs; each node follows the rules, and the rules guarantee the logs end up identical.
+
+---
+
+## 1. What a log entry is
+
+A tiny struct in `message.go`:
+- `Term`: the term of the leader that created it
+- `Index`: its position in the log (1, 2, 3, …)
+- `Data`: the command, as `[]byte` (phase 2 doesn't care what's inside)
+
+**Two entries with the same Index and Term are guaranteed to be the same entry, and so is everything before them.** That's the Log Matching Property, and the whole phase is built on it.
+
+---
+
+## 2. New fields on `Node`
+
+**Replace** `lastLogIndex` and `lastLogTerm` with:
+- `log []Entry`: start it with one dummy entry `{Term: 0, Index: 0}` at position 0. Then real entries start at index 1, and `log[i]` is entry i. The dummy also means "the entry before index 1" always exists, so you never special-case an empty log.
+
+**Add, on every node:**
+- `commitIndex uint64`: the highest entry known to be committed. Starts at 0.
+- `lastApplied uint64`: the highest entry already handed to the application. Starts at 0.
+- `committed []Entry`: an outbox, but for committed entries. Same idea as `outbox`.
+
+**Add, used only while leader:**
+- `nextIndex map[uint64]uint64`: for each peer, the next entry to send them. The leader's guess.
+- `matchIndex map[uint64]uint64`: for each peer, the highest entry we **know** they have. Confirmed.
+
+`nextIndex` is optimistic ("I think they have everything"). `matchIndex` is proven ("they told me they have up to here"). Commit decisions use only `matchIndex`.
+
+---
+
+## 3. Message changes
+
+Your `Heartbeat` becomes **AppendEntries**. You can keep the `Heartbeat` name; it's the same message, it just carries more now. An AppendEntries with no entries **is** a heartbeat.
+
+**Add to `Message`:**
+- `PrevLogIndex`, `PrevLogTerm`: "the entry right before the ones I'm sending is at this index with this term"
+- `Entries []Entry`: the entries being sent (empty for a pure heartbeat)
+- `LeaderCommit`: the leader's `commitIndex`, so followers learn what's committed
+- `Index`: on the **response**, "my log now matches yours up to here"
+
+Your `LastLogIndex` and `LastLogTerm` fields stay. Vote requests still use them.
+
+---
+
+## 4. Methods
+
+### Public (the outside world calls these)
+- **`Propose(data []byte) bool`**: a client wants a command added.
+  - Not leader → return false.
+  - Leader → append `{Term: currentTerm, Index: lastIndex+1, Data: data}` to your own log, send AppendEntries to every peer, return true.
+- **`CommittedEntries() []Entry`**: like `ReadMessages`, but for committed entries. Return `committed`, set it to nil. Tests read this; in phase 5 the KV store reads it.
+- `Tick`, `Step` and `ReadMessages` stay the same. `Step`'s switch gains a `HeartbeatResponse` case (it's no longer ignored).
+
+### Small log helpers (write these first)
+- `lastIndex()`: index of the last entry
+- `lastTerm()`: term of the last entry
+- `termAt(i)`: term of entry i, or "doesn't exist" if i is past the end
+
+Then change `handleVoteRequest` and `sendRequestToPeers` to use `lastIndex()` and `lastTerm()` instead of the old fields. **Run your phase 1 tests now.** They must all still pass.
+
+### Private: sending
+- **`sendAppend(peer)`**: build one AppendEntries for one peer:
+  - `PrevLogIndex = nextIndex[peer] - 1`
+  - `PrevLogTerm = termAt(PrevLogIndex)`
+  - `Entries` = a **copy** of everything from `nextIndex[peer]` to the end (see traps)
+  - `LeaderCommit = commitIndex`
+- **`sendHeartbeats()`**: now just calls `sendAppend(p)` for every peer. A follower that's caught up gets zero entries, which is a plain heartbeat.
+
+### Private: becoming leader (update)
+- **`becomeLeader()`**, in addition to what it does now:
+  - for each peer: `nextIndex[p] = lastIndex() + 1`, `matchIndex[p] = 0`
+  - append a **no-op entry** (empty `Data`) in the new term; see section 6 for why
+  - then `sendHeartbeats()`
+
+### Private: follower side
+- **`handleHeartbeat(m)`** (AppendEntries), in order:
+  1. `becomeFollower(m.Term, m.From)`, same as now.
+  2. **Consistency check:** if `termAt(m.PrevLogIndex)` doesn't exist or ≠ `m.PrevLogTerm`, reply `Reject: true` and stop. Meaning: "I don't have the entry you're building on, so back up."
+  3. **Merge entries:** for each entry in `m.Entries`:
+     - you have nothing at that index → append it
+     - you have an entry there with the **same** term → skip it (already have it)
+     - you have one with a **different** term → delete it and everything after it, then append
+  4. **Learn commits:** if `m.LeaderCommit > commitIndex`, set `commitIndex = min(m.LeaderCommit, index of the last entry in this message)`.
+  5. `applyCommitted()`.
+  6. Reply success with `Index` = the last index this message covered (`PrevLogIndex + len(Entries)`).
+
+### Private: leader side
+- **`handleHeartbeatResponse(m)`**, only if you're still Leader:
+  - **Success:** `matchIndex[m.From] = m.Index`, `nextIndex[m.From] = m.Index + 1`, then `maybeCommit()`.
+  - **Reject:** `nextIndex[m.From]--` (never below 1), then `sendAppend(m.From)` right away. The follower said "back up", so you back up one entry and retry. Repeat until you hit the point where your logs agree.
+- **`maybeCommit()`**: look for the highest index N above `commitIndex` where:
+  - a majority (counting yourself) has `matchIndex >= N`, **and**
+  - `termAt(N) == currentTerm`
+
+  If you find one, set `commitIndex = N` and call `applyCommitted()`.
+
+### Private: everyone
+- **`applyCommitted()`**: while `lastApplied < commitIndex`: `lastApplied++`, then append `log[lastApplied]` to `committed`.
+
+---
+
+## 5. A full round trip (3 nodes, leader = 1)
+
+1. A test calls `node1.Propose("x")`. Node 1 appends entry `{Term 1, Index 2, "x"}` (index 1 is the no-op) and puts AppendEntries for nodes 2 and 3 in its outbox: `Prev = (1, term 1)`, `Entries = [x]`, `LeaderCommit = 1`.
+2. The simulator delivers to node 2. Node 2 checks that it has index 1 with term 1. Yes. It appends `x`, learns commit = min(1, 2) = 1, applies the no-op, and replies `Index: 2`.
+3. The simulator delivers the reply to node 1. Now `matchIndex[2] = 2`, and with node 1 itself that's 2 of 3 nodes holding index 2, in the current term. So `commitIndex = 2` and node 1 applies `x`.
+4. On the next heartbeat, node 1 sends `LeaderCommit = 2`. Nodes 2 and 3 see it and apply `x`.
+
+The followers learn about a commit **one round late**, through the next heartbeat. That's normal.
+
+**Repair example:** node 3 was offline and has only index 0, but the leader guesses `nextIndex[3] = 3`. It sends `Prev = (2, term 1)`. Node 3 doesn't have index 2, so it rejects. The leader sets `nextIndex[3]` to 2 and retries with `Prev = (1, …)`. Rejected again, so it tries `Prev = (0, 0)`, which always matches because of the dummy. Node 3 accepts and gets everything from index 1 onward.
+
+---
+
+## 6. The two rules that make it safe (understand these before coding)
+
+**Why the consistency check works.** The leader only sends entries along with "the entry before them is (i, t)". A follower accepts only if it has exactly that entry. By induction, an accepted entry means the whole prefix matches. That's how logs stay identical without comparing them fully.
+
+**Why a leader only commits entries from its own term (Figure 8).** An entry from an older term can be on a majority of nodes and **still get overwritten** by a later leader. Read §5.4.2 and Figure 8 until you can tell the story yourself. So the leader counts replicas only for current-term entries; older entries commit indirectly, because committing index N commits everything before it.
+
+That's also why `becomeLeader` appends a no-op. Without a current-term entry, a new leader could never commit anything from older terms until a client happened to propose something.
+
+---
+
+## 7. What to read
+1. Raft paper §5.3 (log replication) and §5.4 (safety), especially **§5.4.2 and Figure 8**. In Figure 2, the **AppendEntries RPC** box and the **Leaders** bullets under Rules for Servers.
+2. **Students' Guide to Raft**: the AppendEntries handler mistakes, and why you must never truncate on a matching entry. Skim the "accelerated log backtracking" section; it's optional.
+3. **MIT 6.5840 Lab 3B** handout, for more test scenarios.
+4. **etcd-io/raft**, after your tests pass:
+   - `raft.go`: `appendEntry`, `bcastAppend`, `sendAppend`, `handleAppendEntries`, `maybeCommit`
+   - `log.go`: `maybeAppend`, `findConflict`
+   - `tracker/progress.go`: production `nextIndex`/`matchIndex` (called `Next` and `Match`)
+
+---
+
+## 8. Order to write it (checkpoints)
+
+1. **Real log.** Add `Entry`, the log with the dummy, `lastIndex`/`lastTerm`/`termAt`. Rewire voting. All phase 1 tests pass.
+2. **Happy path.** Add `Propose`, `sendAppend`, the new `becomeLeader` setup, and follower append (no conflict handling yet). Add `handleHeartbeatResponse` success, `maybeCommit`, `applyCommitted`, `CommittedEntries`. Test: 3 nodes, propose one entry, every node applies it.
+3. **Repair.** Add the consistency check, reject → `nextIndex--` → retry, and conflict truncation. Test: an isolated follower catches up after healing.
+4. **Safety.** Add the current-term rule in `maybeCommit` and the no-op entry. Write the Figure 8 test and the chaos test.
+
+---
+
+## 9. Tests (input → expected output)
+
+**Single node, hand-built messages**
+| Test | Input | Expected |
+|------|-------|----------|
+| Propose on follower | `Propose("x")` on a follower | returns false, log unchanged |
+| Reject missing prev | follower with log length 2 gets `PrevLogIndex: 5` | `Reject: true`, log unchanged |
+| Reject wrong prev term | follower has index 2 at term 1, message says `PrevLogTerm: 2` | `Reject: true` |
+| Append | follower gets valid Prev + 2 entries | log grows by 2, reply `Index` = new last index |
+| Conflict truncation | follower has `[1:t1, 2:t1, 3:t1]`, gets `Prev=(1,t1)`, entries `[2:t2]` | log becomes `[1:t1, 2:t2]` (old 2 and 3 deleted) |
+| No truncation on match | follower has 1–3, gets an old message with `Prev=(0,0)`, entries `[1]` | log still has 1–3 |
+| Commit learn | follower gets `LeaderCommit: 3` but message only covers up to 2 | `commitIndex = 2`, not 3 |
+
+**Cluster, with the simulator.** Add a simulator helper that collects `CommittedEntries()` from every node after each tick, so you can compare them.
+| Test | Input | Expected |
+|------|-------|----------|
+| Basic replication | 3 nodes, leader elected, `Propose("x")`, tick | every node applied `x` at the same index |
+| Order | propose a, b, c | every node applies a, b, c in order, with no gaps or duplicates |
+| Lagging follower | isolate a follower, propose 5, heal, tick | the follower catches up and applies all 5 |
+| No majority, no commit | isolate the leader, `Propose` 3 entries to it, tick | those 3 never appear in anyone's committed entries |
+| Overwrite uncommitted | continue: the others elect a new leader, commit 2 new entries; heal | the old leader's 3 entries are replaced; all logs identical |
+| Figure 8 | set up logs by hand as in Figure 8 (c) | the leader does **not** commit the old-term entry by counting replicas |
+| **Chaos** | 5 nodes, 200 seeds, 10% drops, random partitions, a proposal every few ticks to whoever is leader | Election Safety holds, **and** no two nodes ever apply different data at the same index |
+
+**Done when:** all pass under `go test -race -count=20 ./raft/`, and you can explain without notes:
+- why the consistency check guarantees whole-prefix matching
+- why a leader can't commit an old-term entry by counting replicas
+- why a follower must never truncate on a matching entry
+- why `commitIndex` on a follower is capped at the last new entry
+
+---
+
+## 10. Common traps
+- **Slice aliasing.** `Entries` is a slice. If the leader sends `log[i:]` directly and the follower appends that slice into its own log, two nodes share memory, and later edits corrupt each other. Copy when building the message (`append([]Entry(nil), …)`).
+- Truncating the log on **every** AppendEntries instead of only at a real conflict.
+- Setting `commitIndex = LeaderCommit` without the `min`.
+- Forgetting to reset `nextIndex`/`matchIndex` in `becomeLeader`, so a new leader uses stale numbers.
+- `nextIndex` going below 1. With `uint64` this wraps to a huge number instead of going negative.
+- Applying entries as soon as they arrive, instead of only up to `commitIndex`.
+- Handling a `HeartbeatResponse` after you've stopped being leader. Check the role first.
